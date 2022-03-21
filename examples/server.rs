@@ -1,7 +1,8 @@
 extern crate coap;
 
+use std::net::SocketAddr;
 use coap::Server;
-use coap_lite::RequestType as Method;
+use coap_lite::{CoapRequest, RequestType as Method};
 use tokio::runtime::Runtime;
 
 fn main() {
@@ -12,7 +13,7 @@ fn main() {
         println!("Server up on {}", addr);
 
         server
-            .run(|request| async {
+            .run(|request: CoapRequest<SocketAddr>| async {
                 match request.get_method() {
                     &Method::Get => println!("request by get {}", request.get_path()),
                     &Method::Post => println!(

@@ -15,6 +15,7 @@ use tokio::{
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::udp::UdpFramed;
+use async_trait::async_trait;
 
 use super::message::Codec;
 use super::observer::Observer;
@@ -41,21 +42,31 @@ pub enum Message {
     Received(Packet, SocketAddr),
 }
 
-pub struct Server<'a, HandlerRet>
-where
-    HandlerRet: Future<Output = Option<CoapResponse>>,
-{
+pub struct Server {
     server: CoAPServer,
     observer: Observer,
-    handler: Option<Box<dyn FnMut(CoapRequest<SocketAddr>) -> HandlerRet + Send + 'a>>,
+    handler: Option<Box<dyn RequestHandler>>,
 }
 
-impl<'a, HandlerRet> Server<'a, HandlerRet>
-where
-    HandlerRet: Future<Output = Option<CoapResponse>>,
-{
+#[async_trait]
+pub trait RequestHandler: Send + 'static {
+    async fn handle_request(&mut self, request: CoapRequest<SocketAddr>) -> Option<CoapResponse>;
+}
+
+#[async_trait]
+impl<F, R> RequestHandler for F
+    where
+        F: 'static,
+        F: Fn(CoapRequest<SocketAddr>) -> R + Send + Sync,
+        R: Future<Output = Option<CoapResponse>> + Send + Sync {
+    async fn handle_request(&mut self, request: CoapRequest<SocketAddr>) -> Option<CoapResponse> {
+        (self)(request).await
+    }
+}
+
+impl Server {
     /// Creates a CoAP server listening on the given address.
-    pub fn new<A: ToSocketAddrs>(addr: A) -> Result<Server<'a, HandlerRet>, io::Error> {
+    pub fn new<A: ToSocketAddrs>(addr: A) -> Result<Server, io::Error> {
         let (tx, rx) = mpsc::unbounded_channel();
         Ok(Server {
             server: CoAPServer::new(addr, rx)?,
@@ -65,10 +76,7 @@ where
     }
 
     /// run the server.
-    pub async fn run<F: FnMut(CoapRequest<SocketAddr>) -> HandlerRet + Send + 'a>(
-        &mut self,
-        handler: F,
-    ) -> Result<(), io::Error> {
+    pub async fn run<R: RequestHandler>(&mut self, handler: R) -> Result<(), io::Error> {
         self.handler = Some(Box::new(handler));
 
         loop {
@@ -109,7 +117,7 @@ where
         }
 
         if let Some(ref mut handler) = self.handler {
-            match handler(request).await {
+            match handler.handle_request(request).await {
                 Some(response) => {
                     debug!("Response: {:?}", response);
                     self.server.send((response.message, addr)).await?;
@@ -354,16 +362,10 @@ pub mod test {
     use coap_lite::CoapOption;
     use std::{sync::mpsc, time::Duration};
 
-    pub fn spawn_server<
-        F: FnMut(CoapRequest<SocketAddr>) -> HandlerRet + Send + 'static,
-        HandlerRet,
-    >(
+    pub fn spawn_server<R: RequestHandler>(
         ip: &'static str,
-        request_handler: F,
-    ) -> mpsc::Receiver<u16>
-    where
-        HandlerRet: Future<Output = Option<CoapResponse>>,
-    {
+        request_handler: R,
+    ) -> mpsc::Receiver<u16> {
         let (tx, rx) = mpsc::channel();
 
         std::thread::Builder::new()
@@ -397,17 +399,11 @@ pub mod test {
         }
     }
 
-    pub fn spawn_server_with_all_coap<
-        F: FnMut(CoapRequest<SocketAddr>) -> HandlerRet + Send + 'static,
-        HandlerRet,
-    >(
+    pub fn spawn_server_with_all_coap<R: RequestHandler>(
         ip: &'static str,
-        request_handler: F,
+        request_handler: R,
         segment: u8,
-    ) -> mpsc::Receiver<u16>
-    where
-        HandlerRet: Future<Output = Option<CoapResponse>>,
-    {
+    ) -> mpsc::Receiver<u16> {
         let (tx, rx) = mpsc::channel();
 
         std::thread::Builder::new()

@@ -1,7 +1,9 @@
 extern crate coap;
 
+use std::net::SocketAddr;
 use coap::{CoAPClient, Server};
 use std::thread;
+use coap_lite::CoapRequest;
 use tokio::runtime::Runtime;
 
 fn main() {
@@ -10,7 +12,7 @@ fn main() {
             let mut server = Server::new("127.0.0.1:5683").unwrap();
 
             server
-                .run(|request| async {
+                .run(|request: CoapRequest<SocketAddr>| async {
                     let uri_path = request.get_path().to_string();
 
                     return match request.response {

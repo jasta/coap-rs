@@ -23,6 +23,7 @@ tokio-stream = {version = "^0.1", features = ["time"]}
 futures = "^0.3"
 bytes = "^1.1"
 coap-lite = "^0.8"
+async-trait = "0.1.52"
 
 [dev-dependencies]
 quickcheck = "0.8.2"

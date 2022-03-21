@@ -29,7 +29,8 @@
 //! ```no_run
 //! extern crate coap;
 //!
-//! use coap_lite::{RequestType as Method};
+//! use std::net::SocketAddr;
+//! use coap_lite::{RequestType as Method, CoapRequest};
 //! use coap::Server;
 //! use tokio::runtime::Runtime;
 
@@ -40,7 +41,7 @@
 //!         let mut server = Server::new(addr).unwrap();
 //!         println!("Server up on {}", addr);
 //!
-//!         server.run(|request| async {
+//!         server.run(|request: CoapRequest<SocketAddr>| async {
 //!             match request.get_method() {
 //!                 &Method::Get => println!("request by get {}", request.get_path()),
 //!                 &Method::Post => println!("request by post {}", String::from_utf8(request.message.payload).unwrap()),
