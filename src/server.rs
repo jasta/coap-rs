@@ -1,9 +1,8 @@
 use coap_lite::{CoapRequest, CoapResponse, Packet};
-use futures::{select, stream::FusedStream, task::Poll, SinkExt, Stream, StreamExt};
+use futures::{select, SinkExt, Stream, stream::FusedStream, StreamExt, task::Poll};
 use log::{debug, error};
 use std::{
     self,
-    future::Future,
     net::{self, IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
     pin::Pin,
     task::Context,
@@ -13,15 +12,18 @@ use tokio::{
     net::UdpSocket,
     sync::mpsc::{self},
 };
+use futures::stream::Fuse;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::udp::UdpFramed;
-use async_trait::async_trait;
+use coap_lite::error::HandlingError;
+use crate::request_handler::{RequestHandler, ResponseBehaviour};
+use crate::synthetic_request::{SyntheticMessageReceiver, SyntheticMessageSender, SyntheticRequest, SyntheticResponse};
 
 use super::message::Codec;
 use super::observer::Observer;
 
 pub type MessageSender = mpsc::UnboundedSender<(Packet, SocketAddr)>;
-type MessageReceiver = UnboundedReceiverStream<(Packet, SocketAddr)>;
+pub(crate) type MessageReceiver = UnboundedReceiverStream<(Packet, SocketAddr)>;
 
 #[derive(Debug)]
 pub enum CoAPServerError {
@@ -38,45 +40,45 @@ pub struct QueuedMessage {
 }
 
 pub enum Message {
+    /// Packet to be sent to the remote peer.
     NeedSend(Packet, SocketAddr),
+
+    /// Packet received from the remote peer.
     Received(Packet, SocketAddr),
 }
 
-pub struct Server {
+pub struct Server<'a> {
+    socket_tx: MessageSender,
+    synthetic_request_rx: Fuse<SyntheticMessageReceiver>,
+    synthetic_reply_tx: SyntheticMessageSender,
     server: CoAPServer,
     observer: Observer,
-    handler: Option<Box<dyn RequestHandler>>,
+    handler: Option<Box<dyn RequestHandler + 'a>>,
 }
 
-#[async_trait]
-pub trait RequestHandler: Send + 'static {
-    async fn handle_request(&mut self, request: CoapRequest<SocketAddr>) -> Option<CoapResponse>;
-}
-
-#[async_trait]
-impl<F, R> RequestHandler for F
-    where
-        F: 'static,
-        F: Fn(CoapRequest<SocketAddr>) -> R + Send + Sync,
-        R: Future<Output = Option<CoapResponse>> + Send + Sync {
-    async fn handle_request(&mut self, request: CoapRequest<SocketAddr>) -> Option<CoapResponse> {
-        (self)(request).await
-    }
-}
-
-impl Server {
+impl<'a> Server<'a> {
     /// Creates a CoAP server listening on the given address.
-    pub fn new<A: ToSocketAddrs>(addr: A) -> Result<Server, io::Error> {
-        let (tx, rx) = mpsc::unbounded_channel();
+    pub fn new<A: ToSocketAddrs>(addr: A) -> Result<Server<'a>, io::Error> {
+        let (socket_tx, socket_rx) = mpsc::unbounded_channel();
+        let (synthetic_request_tx, synthetic_request_rx) = mpsc::unbounded_channel();
+        let (synthetic_reply_tx, synthetic_reply_rx) = mpsc::unbounded_channel();
+        let server = CoAPServer::new(addr, socket_rx)?;
+        let observer = Observer::new(
+            socket_tx.clone(),
+            synthetic_request_tx,
+            UnboundedReceiverStream::new(synthetic_reply_rx));
         Ok(Server {
-            server: CoAPServer::new(addr, rx)?,
-            observer: Observer::new(tx),
+            socket_tx,
+            synthetic_request_rx: UnboundedReceiverStream::new(synthetic_request_rx).fuse(),
+            synthetic_reply_tx,
+            server,
+            observer,
             handler: None,
         })
     }
 
     /// run the server.
-    pub async fn run<R: RequestHandler>(&mut self, handler: R) -> Result<(), io::Error> {
+    pub async fn run(&mut self, handler: impl RequestHandler + 'a) -> Result<(), io::Error> {
         self.handler = Some(Box::new(handler));
 
         loop {
@@ -87,15 +89,21 @@ impl Server {
                             self.server.send((packet, addr)).await?;
                         }
                         Ok(Message::Received(packet, addr)) => {
-                            self.dispatch_msg(packet, addr).await?;
+                            self.handle_request(packet, addr).await?;
                         }
                         Err(e) => {
                             error!("select error: {:?}", e);
                         }
                     }
                 }
-                _ = self.observer.select_next_some() => {
+                synthetic = self.synthetic_request_rx.select_next_some() => {
+                    self.handle_synthetic_request(synthetic.0, synthetic.1, self.synthetic_reply_tx).await?
+                }
+                _ = self.observer.select_timer() => {
                     self.observer.timer_handler().await;
+                }
+                message = self.observer.select_synthetic_reply() => {
+                    self.observer.handle_synthetic_reply(message.0, message.1).await;
                 }
                 complete => break,
             }
@@ -109,25 +117,60 @@ impl Server {
         self.server.socket_addr()
     }
 
-    async fn dispatch_msg(&mut self, packet: Packet, addr: SocketAddr) -> Result<(), io::Error> {
-        let request = CoapRequest::from_packet(packet, addr);
-        let filtered = !self.observer.request_handler(&request).await;
-        if filtered {
-            return Ok(());
-        }
+    async fn handle_request(&mut self, packet: Packet, addr: SocketAddr) -> Result<(), io::Error> {
+        let mut request = CoapRequest::from_packet(packet, addr);
+        let behaviour = self.handle_request_internal(&mut request).await
+            .unwrap_or_else(|err| {
+                match request.apply_from_error(err) {
+                    true => ResponseBehaviour::Normal,
+                    false => ResponseBehaviour::Swallow,
+                }
+            });
 
-        if let Some(ref mut handler) = self.handler {
-            match handler.handle_request(request).await {
-                Some(response) => {
-                    debug!("Response: {:?}", response);
-                    self.server.send((response.message, addr)).await?;
+        match behaviour {
+            ResponseBehaviour::Normal => {
+                if let Some(response) = request.response {
+                    self.schedule_send_response(response, addr);
                 }
-                None => {
-                    debug!("No response");
-                }
+            },
+            ResponseBehaviour::Swallow => {
+                debug!("Swallowing reply from {:?} for {}", addr, request.get_path());
             }
         }
         Ok(())
+    }
+
+    async fn handle_request_internal(&mut self, request: &mut CoapRequest<SocketAddr>) -> Result<ResponseBehaviour, HandlingError> {
+        if self.observer.intercept_request(&request).await? {
+            return Ok(ResponseBehaviour::Normal);
+        }
+
+        if let Some(ref mut handler) = self.handler {
+            let behaviour = handler.handle_request(request).await;
+            if behaviour == ResponseBehaviour::Normal {
+                self.observer.intercept_response(&request).await?;
+            }
+            Ok(behaviour)
+        } else {
+            Ok(ResponseBehaviour::Swallow)
+        }
+    }
+
+    async fn handle_synthetic_request(&mut self, request: CoapRequest<SocketAddr>, opaque_extra: String) {
+        if let Some(ref mut handler) = self.handler {
+            handler.handle_request(&mut request);
+        }
+    }
+
+    fn schedule_send_response(&self, response: CoapResponse, addr: SocketAddr) {
+        self.socket_tx.send((response.message, addr))
+            .expect("tx channel closed unexpectedly");
+    }
+
+    async fn resource_changed(&mut self, path: &str) {
+        if let Err(err) = self.observer.signal_resource_changed(path) {
+            debug!("signal_resource_changed: path={}, err={:?}", path, err);
+        }
     }
 
     /// enable AllCoAP multicasts - adds the AllCoap addresses to the listener
@@ -173,7 +216,7 @@ impl Server {
     /// ffx3::/16	239.255.0.0/16	            IPv4 local scope
     /// ffx4::/16	            	            Admin-local	        The smallest scope that must be administratively configured.
     /// ffx5::/16		                        Site-local	        Restricted to the local physical network.
-    /// ffx8::/16	239.192.0.0/14	            Organization-local	Restricted to networks used by the organization administering the local network. (For example, these addresses might be used over VPNs; when packets for this group are routed over the public internet (where these addresses are not valid), they would have to be encapsulated in some other protocol.)
+    /// ffx8::/16	239.192.0.0/14	            Organization-local	Restricted to networks used by the organization administering the local network. (For example, these addresses might be used over VPNs; when packets for this group are routed over the public internet (where these addresses are not valid), they would have to be enccapsulated in some other protocol.)
     /// ffxe::/16	224.0.1.0-238.255.255.255	Global scope	    Eligible to be routed over the public internet.
     ///
     /// Notable addresses:
@@ -361,10 +404,12 @@ pub mod test {
     use super::*;
     use coap_lite::CoapOption;
     use std::{sync::mpsc, time::Duration};
+    use async_trait::async_trait;
+    use crate::request_handler::ResponseBehaviour;
 
-    pub fn spawn_server<R: RequestHandler>(
+    pub fn spawn_server(
         ip: &'static str,
-        request_handler: R,
+        request_handler: impl RequestHandler + 'static,
     ) -> mpsc::Receiver<u16> {
         let (tx, rx) = mpsc::channel();
 
@@ -386,22 +431,24 @@ pub mod test {
         rx
     }
 
-    async fn request_handler(req: CoapRequest<SocketAddr>) -> Option<CoapResponse> {
-        let uri_path_list = req.message.get_option(CoapOption::UriPath).unwrap().clone();
-        assert_eq!(uri_path_list.len(), 1);
+    #[derive(Default)]
+    struct TestRequestHandler;
+    #[async_trait]
+    impl RequestHandler for TestRequestHandler {
+        async fn handle_request(&mut self, request: &mut CoapRequest<SocketAddr>) -> ResponseBehaviour {
+            let uri_path_list = request.message.get_option(CoapOption::UriPath).unwrap().clone();
+            assert_eq!(uri_path_list.len(), 1);
 
-        match req.response {
-            Some(mut response) => {
+            if let Some(response) = &mut request.response {
                 response.message.payload = uri_path_list.front().unwrap().clone();
-                Some(response)
             }
-            _ => None,
+            ResponseBehaviour::default()
         }
     }
 
-    pub fn spawn_server_with_all_coap<R: RequestHandler>(
+    pub fn spawn_server_with_all_coap(
         ip: &'static str,
-        request_handler: R,
+        request_handler: impl RequestHandler + 'static,
         segment: u8,
     ) -> mpsc::Receiver<u16> {
         let (tx, rx) = mpsc::channel();
@@ -428,7 +475,7 @@ pub mod test {
 
     #[test]
     fn test_echo_server() {
-        let server_port = spawn_server("127.0.0.1:0", request_handler).recv().unwrap();
+        let server_port = spawn_server("127.0.0.1:0", TestRequestHandler::default()).recv().unwrap();
 
         let client = CoAPClient::new(format!("127.0.0.1:{}", server_port)).unwrap();
         let mut request = CoapRequest::new();
@@ -452,7 +499,7 @@ pub mod test {
     #[test]
     #[ignore]
     fn test_echo_server_v6() {
-        let server_port = spawn_server("::1:0", request_handler).recv().unwrap();
+        let server_port = spawn_server("::1:0", TestRequestHandler::default()).recv().unwrap();
 
         let client = CoAPClient::new(format!("::1:{}", server_port)).unwrap();
         let mut request = CoapRequest::new();
@@ -475,7 +522,7 @@ pub mod test {
 
     #[test]
     fn test_echo_server_no_token() {
-        let server_port = spawn_server("127.0.0.1:0", request_handler).recv().unwrap();
+        let server_port = spawn_server("127.0.0.1:0", TestRequestHandler::default()).recv().unwrap();
 
         let client = CoAPClient::new(format!("127.0.0.1:{}", server_port)).unwrap();
         let mut packet = CoapRequest::new();
@@ -498,7 +545,7 @@ pub mod test {
     #[test]
     #[ignore]
     fn test_echo_server_no_token_v6() {
-        let server_port = spawn_server("::1:0", request_handler).recv().unwrap();
+        let server_port = spawn_server("::1:0", TestRequestHandler::default()).recv().unwrap();
 
         let client = CoAPClient::new(format!("::1:{}", server_port)).unwrap();
         let mut packet = CoapRequest::new();
@@ -527,7 +574,7 @@ pub mod test {
         let (tx2, rx2) = mpsc::channel();
         let mut step = 1;
 
-        let server_port = spawn_server("127.0.0.1:0", request_handler).recv().unwrap();
+        let server_port = spawn_server("127.0.0.1:0", TestRequestHandler::default()).recv().unwrap();
 
         let mut client = CoAPClient::new(format!("127.0.0.1:{}", server_port)).unwrap();
 
@@ -573,7 +620,7 @@ pub mod test {
     fn multicast_server_all_coap() {
         // segment not relevant with IPv4
         let segment = 0x0;
-        let server_port = spawn_server_with_all_coap("0.0.0.0", request_handler, segment)
+        let server_port = spawn_server_with_all_coap("0.0.0.0", TestRequestHandler::default(), segment)
             .recv()
             .unwrap();
 
@@ -621,7 +668,7 @@ pub mod test {
     fn multicast_server_all_coap_v6() {
         // use segment 0x04 which should be the smallest administered scope
         let segment = 0x04;
-        let server_port = spawn_server_with_all_coap("::0", request_handler, segment)
+        let server_port = spawn_server_with_all_coap("::0", TestRequestHandler::default(), segment)
             .recv()
             .unwrap();
 
@@ -677,7 +724,7 @@ pub mod test {
                         server.join_multicast(IpAddr::V4(Ipv4Addr::new(224, 1, 1, 1)));
                         server.leave_multicast(IpAddr::V4(Ipv4Addr::new(224, 0, 1, 1)));
                         server.leave_multicast(IpAddr::V4(Ipv4Addr::new(224, 1, 1, 1)));
-                        server.run(request_handler).await.unwrap();
+                        server.run(TestRequestHandler::default()).await.unwrap();
                     })
             })
             .unwrap();
@@ -707,7 +754,7 @@ pub mod test {
                         server.join_multicast(IpAddr::V6(Ipv6Addr::new(
                             0xff02, 0, 0, 0, 0, 1, 0, 0x2,
                         )));
-                        server.run(request_handler).await.unwrap();
+                        server.run(TestRequestHandler::default()).await.unwrap();
                     })
             })
             .unwrap();

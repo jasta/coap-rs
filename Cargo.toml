@@ -22,8 +22,10 @@ tokio-util = {version = "^0.6", features = ["codec","net"]}
 tokio-stream = {version = "^0.1", features = ["time"]}
 futures = "^0.3"
 bytes = "^1.1"
-coap-lite = "^0.8"
+coap-lite = "0.9.0"
 async-trait = "0.1.52"
+anyhow = "1.0.56"
+thiserror = "1.0.30"
 
 [dev-dependencies]
 quickcheck = "0.8.2"

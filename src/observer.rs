@@ -1,19 +1,18 @@
-use coap_lite::{
-    CoapRequest, MessageClass, MessageType, ObserveOption, Packet, RequestType as Method,
-    ResponseType as Status,
-};
-use futures::{
-    stream::{Fuse, SelectNextSome},
-    StreamExt,
-};
+use coap_lite::{CoapRequest, MessageType, ObserveOption, Packet, RequestType as Method, ResponseType as Status};
 use log::{debug, warn};
 use std::{
     collections::{hash_map::Entry, HashMap, HashSet},
     net::SocketAddr,
     time::Duration,
 };
+use anyhow::anyhow;
+use coap_lite::error::HandlingError;
+use futures::stream::{Fuse, SelectNextSome};
+use futures::StreamExt;
 use tokio::time::interval;
 use tokio_stream::wrappers::IntervalStream;
+use crate::server::MessageReceiver;
+use crate::synthetic_request::{SyntheticMessageReceiver, SyntheticMessageSender};
 
 use super::server::MessageSender;
 
@@ -24,9 +23,17 @@ pub struct Observer {
     resources: HashMap<String, ResourceItem>,
     register_resources: HashMap<String, RegisterResourceItem>,
     unacknowledge_messages: HashMap<u16, UnacknowledgeMessageItem>,
-    tx_sender: MessageSender,
+    socket_tx: MessageSender,
+    synthetic_request_tx: SyntheticMessageSender,
+    synthetic_reply_rx: Fuse<SyntheticMessageReceiver>,
     current_message_id: u16,
     timer: Fuse<IntervalStream>,
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum ObserveError {
+    #[error("no observes for subject {0}")]
+    NoObservers(String),
 }
 
 #[derive(Debug)]
@@ -34,9 +41,8 @@ struct RegisterItem {
     register_resources: HashSet<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct ResourceItem {
-    payload: Vec<u8>,
     register_resources: HashSet<String>,
     sequence: u32,
 }
@@ -45,7 +51,7 @@ struct ResourceItem {
 struct RegisterResourceItem {
     register: String,
     resource: String,
-    token: Vec<u8>,
+    original_request: CoapRequest<SocketAddr>,
     unacknowledge_message: Option<u16>,
 }
 
@@ -57,48 +63,76 @@ struct UnacknowledgeMessageItem {
 
 impl Observer {
     /// Creates an observer with channel to send message.
-    pub fn new(tx_sender: MessageSender) -> Observer {
+    pub fn new(socket_tx: MessageSender, synthetic_request_tx: SyntheticMessageSender, synthetic_reply_rx: SyntheticMessageReceiver) -> Observer {
         Observer {
             registers: HashMap::new(),
             resources: HashMap::new(),
             register_resources: HashMap::new(),
             unacknowledge_messages: HashMap::new(),
-            tx_sender: tx_sender,
+            socket_tx,
+            synthetic_request_tx,
+            synthetic_reply_rx: synthetic_reply_rx.fuse(),
             current_message_id: 0,
             timer: IntervalStream::new(interval(Duration::from_secs(1))).fuse(),
         }
     }
 
-    /// poll the observer's timer.
-    pub fn select_next_some(&mut self) -> SelectNextSome<Fuse<IntervalStream>> {
-        self.timer.select_next_some()
+    /// filter the requests belong to the observer.
+    pub async fn intercept_request(
+        &mut self,
+        request: &CoapRequest<SocketAddr>
+    ) -> Result<bool, HandlingError> {
+        if request.message.header.get_type() == MessageType::Acknowledgement {
+            self.remove_unacknowledge_message(
+                &request.message.header.message_id,
+                &request.message.get_token(),
+            )
+        } else {
+            Ok(false)
+        }
     }
 
-    /// filter the requests belong to the observer.
-    pub async fn request_handler(&mut self, request: &CoapRequest<SocketAddr>) -> bool {
-        if request.message.header.get_type() == MessageType::Acknowledgement {
-            self.acknowledge(request);
-            return false;
+    /// intercept the request and response after the request handler has had a chance to
+    /// generate the reply.
+    pub async fn intercept_response(
+        &mut self,
+        request: &CoapRequest<SocketAddr>
+    ) -> Result<bool, HandlingError> {
+        if request.get_method() != &Method::Get &&
+            request.get_method() != &Method::Fetch {
+            return Ok(false);
+        }
+        if let Some(ref response) = request.response {
+            if response.get_status() != &Status::Content &&
+                response.get_status() != &Status::Valid {
+                return Ok(false)
+            }
+        } else {
+            return Ok(false)
         }
 
-        match (request.get_method(), request.get_observe_flag()) {
-            (&Method::Get, Some(observe_option)) => match observe_option {
-                Ok(ObserveOption::Register) => {
-                    self.register(request).await;
-                    return false;
-                }
-                Ok(ObserveOption::Deregister) => {
-                    self.deregister(request);
-                    return true;
-                }
-                _ => return true,
-            },
-            (&Method::Put, _) => {
-                self.resource_changed(request).await;
-                return true;
+        if let Some(observe_flag) = request.get_observe_flag() {
+            return match observe_flag {
+                Ok(option) => {
+                    match option {
+                        ObserveOption::Register => self.register(request),
+                        ObserveOption::Deregister => self.deregister(request),
+                    }
+                    Ok(true)
+                },
+                Err(err) => Err(HandlingError::bad_request(err.to_string())),
             }
-            _ => return true,
         }
+
+        Ok(false)
+    }
+
+    pub fn select_synthetic_reply(&mut self) -> SelectNextSome<Fuse<SyntheticMessageReceiver>> {
+        self.synthetic_reply_rx.select_next_some()
+    }
+
+    pub fn select_timer(&mut self) -> SelectNextSome<Fuse<IntervalStream>> {
+        self.timer.select_next_some()
     }
 
     /// trigger send the unacknowledge messages.
@@ -114,44 +148,81 @@ impl Observer {
 
         for register_resource_key in register_resource_keys {
             if self.try_unacknowledge_message(&register_resource_key) {
-                self.notify_register_with_newest_resource(&register_resource_key)
-                    .await;
+                self.send_synthetic_request(&register_resource_key);
             }
         }
     }
 
-    async fn register(&mut self, request: &CoapRequest<SocketAddr>) {
+    pub fn signal_resource_changed(&mut self, path: &str) -> Result<(), ObserveError> {
+        let resource = self.resources.get(path)
+            .ok_or_else(|| ObserveError::NoObservers(path.to_owned()))?;
+
+        for register_resource_key in &resource.register_resources {
+            self.send_synthetic_request(register_resource_key);
+        }
+
+        Ok(())
+    }
+
+    /// Issue a copy of the original request that will be handled internally and the reply sent
+    /// back to us to be fixed up with an Observe option value then dispatched as a notification.
+    // TODO: Would be nice to cache the requests and response pairs so that we don't duplicate
+    // work in a 1-to-many observation situation...
+    fn send_synthetic_request(&self, register_resource_key: &str) {
+        let register_item = self.register_resources.get(register_resource_key).unwrap();
+        let synthetic_request = register_item.original_request.clone();
+
+        // Re-issue the original request and get the reply on `synthetic_reply_rx`.  Once we get it,
+        // we'll issue the real socket tx for the notification.
+        self.synthetic_request_tx.send((synthetic_request, register_resource_key.to_string()))
+            .expect("tx channel closed unexpectedly");
+    }
+
+    pub async fn handle_synthetic_reply(&mut self, request: CoapRequest<SocketAddr>, register_resource_key: String) {
+        if let Err(e) = self.handle_synthetic_reply_internal(request, register_resource_key).await {
+            warn!("Error handling synthetic reply: {e:?}");
+        }
+    }
+
+    async fn handle_synthetic_reply_internal(&mut self, mut request: CoapRequest<SocketAddr>, register_resource_key: String) -> anyhow::Result<()> {
+        let register_item = self.register_resources.get(&register_resource_key)
+            .ok_or_else(|| anyhow!("Registration canceled before synthetic reply available"))?;
+        let resource = self.resources.get_mut(&register_item.resource)
+            .ok_or_else(|| anyhow!("Internal error, resource removed???"))?;
+
+        // TODO: We should technically be able to support non-confirmable notifications but
+        // we don't really have an API for that yet.
+        let packet = &mut request.message;
+        packet.header.set_type(MessageType::Confirmable);
+
+        // Update with the new message_id, note though we do not need to copy the token
+        // as that's handled for us by storing the original request.
+        self.current_message_id += 1;
+        packet.header.message_id = self.current_message_id;
+
+        resource.sequence += 1;
+        packet.set_observe_value(resource.sequence);
+
+        let address = register_item.original_request.source.unwrap();
+        self.send_message(&address, packet).await;
+
+        self.record_unacknowledge_message(&register_resource_key);
+
+        Ok(())
+    }
+
+    fn register(&mut self, request: &CoapRequest<SocketAddr>) {
         let register_address = request.source.unwrap();
         let resource_path = request.get_path();
 
         debug!("register {} {}", register_address, resource_path);
 
-        // reply NotFound if resource doesn't exist
-        if !self.resources.contains_key(&resource_path) {
-            if let Some(ref response) = request.response {
-                let mut response2 = response.clone();
-                response2.set_status(Status::NotFound);
-                self.send_message(&register_address, &response2.message)
-                    .await;
-            }
-            return;
-        }
+        self.resources.entry(resource_path).or_default();
 
-        self.record_register_resource(
-            &register_address,
-            &resource_path,
-            &request.message.get_token(),
-        );
-
-        let resource = self.resources.get(&resource_path).unwrap();
-
-        if let Some(ref response) = request.response {
-            let mut response2 = response.clone();
-            response2.message.payload = resource.payload.clone();
-            response2.message.set_observe_value(resource.sequence);
-            self.send_message(&register_address, &response2.message)
-                .await;
-        }
+        // We need to make it again from the request packet so we don't end up cloning and re-using
+        // the original reply in subsequent synthetic requests.
+        let original_request = CoapRequest::from_packet(request.message.clone(), request.source.unwrap());
+        self.record_register_resource(original_request);
     }
 
     fn deregister(&mut self, request: &CoapRequest<SocketAddr>) {
@@ -167,48 +238,19 @@ impl Observer {
         );
     }
 
-    async fn resource_changed(&mut self, request: &CoapRequest<SocketAddr>) {
-        let resource_path = request.get_path();
-        let ref resource_payload = request.message.payload;
-
-        debug!("resource_changed {} {:?}", resource_path, resource_payload);
-
-        let register_resource_keys: Vec<String>;
-        {
-            let resource = self.record_resource(&resource_path, &resource_payload);
-            register_resource_keys = resource
-                .register_resources
-                .iter()
-                .map(|k| k.clone())
-                .collect();
-        }
-
-        for register_resource_key in register_resource_keys {
-            self.gen_message_id();
-            self.notify_register_with_newest_resource(&register_resource_key)
-                .await;
-            self.record_unacknowledge_message(&register_resource_key);
-        }
-    }
-
-    fn acknowledge(&mut self, request: &CoapRequest<SocketAddr>) {
-        self.remove_unacknowledge_message(
-            &request.message.header.message_id,
-            &request.message.get_token(),
-        );
-    }
-
-    fn record_register_resource(&mut self, address: &SocketAddr, path: &String, token: &[u8]) {
-        let resource = self.resources.get_mut(path).unwrap();
+    fn record_register_resource(&mut self, request: CoapRequest<SocketAddr>) {
+        let address: SocketAddr = request.source.unwrap();
+        let path = request.get_path();
+        let resource = self.resources.get_mut(&path).unwrap();
         let register_key = Self::format_register(&address);
-        let register_resource_key = Self::format_register_resource(&address, path);
+        let register_resource_key = Self::format_register_resource(&address, &path);
 
         self.register_resources
             .entry(register_resource_key.clone())
             .or_insert(RegisterResourceItem {
                 register: register_key.clone(),
                 resource: path.clone(),
-                token: token.into(),
+                original_request: request,
                 unacknowledge_message: None,
             });
         resource
@@ -279,17 +321,15 @@ impl Observer {
         return true;
     }
 
-    fn record_resource(&mut self, path: &String, payload: &Vec<u8>) -> &ResourceItem {
+    fn record_resource(&mut self, path: &String) -> &ResourceItem {
         match self.resources.entry(path.clone()) {
             Entry::Occupied(resource) => {
                 let mut r = resource.into_mut();
                 r.sequence += 1;
-                r.payload = payload.clone();
                 return r;
             }
             Entry::Vacant(v) => {
                 return v.insert(ResourceItem {
-                    payload: payload.clone(),
                     register_resources: HashSet::new(),
                     sequence: 0,
                 });
@@ -349,55 +389,29 @@ impl Observer {
         return try_again;
     }
 
-    fn remove_unacknowledge_message(&mut self, message_id: &u16, token: &[u8]) {
+    fn remove_unacknowledge_message(
+        &mut self,
+        message_id: &u16,
+        token: &[u8]
+    ) -> Result<bool, HandlingError> {
         if let Some(message) = self.unacknowledge_messages.get_mut(message_id) {
             let register_resource = self
                 .register_resources
                 .get_mut(&message.register_resource)
                 .unwrap();
             if register_resource.token != *token {
-                return;
+                return Err(HandlingError::internal("message id <-> token mismatch, cannot process ack!"));
             }
 
             register_resource.unacknowledge_message = None;
         }
 
-        self.unacknowledge_messages.remove(message_id);
-    }
-
-    async fn notify_register_with_newest_resource(&mut self, register_resource_key: &String) {
-        let message_id = self.current_message_id;
-
-        debug!("notify {} {}", register_resource_key, message_id);
-
-        let ref mut message = Packet::new();
-        message.header.set_type(MessageType::Confirmable);
-        message.header.code = MessageClass::Response(Status::Content);
-
-        let address: SocketAddr;
-        {
-            let register_resource = self.register_resources.get(register_resource_key).unwrap();
-            let resource = self.resources.get(&register_resource.resource).unwrap();
-
-            message.set_token(register_resource.token.clone());
-            message.set_observe_value(resource.sequence);
-            message.header.message_id = message_id;
-            message.payload = resource.payload.clone();
-
-            address = register_resource.register.parse().unwrap();
-        }
-
-        self.send_message(&address, &message).await;
+        Ok(self.unacknowledge_messages.remove(message_id).is_some())
     }
 
     async fn send_message(&mut self, address: &SocketAddr, message: &Packet) {
         debug!("send_message {:?} {:?}", address, message);
-        self.tx_sender.send((message.clone(), *address)).unwrap();
-    }
-
-    fn gen_message_id(&mut self) -> u16 {
-        self.current_message_id += 1;
-        return self.current_message_id;
+        self.socket_tx.send((message.clone(), *address)).unwrap();
     }
 
     fn format_register(address: &SocketAddr) -> String {

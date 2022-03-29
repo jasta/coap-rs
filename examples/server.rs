@@ -13,7 +13,7 @@ fn main() {
         println!("Server up on {}", addr);
 
         server
-            .run(|request: CoapRequest<SocketAddr>| async {
+            .run(|request| async {
                 match request.get_method() {
                     &Method::Get => println!("request by get {}", request.get_path()),
                     &Method::Post => println!(

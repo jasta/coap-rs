@@ -424,6 +424,7 @@ mod test {
     use super::*;
     use std::io::ErrorKind;
     use std::time::Duration;
+    use crate::request_handler::legacy_handler;
 
     #[test]
     fn test_parse_coap_url_good_url() {
@@ -467,7 +468,7 @@ mod test {
 
     #[test]
     fn test_get_url_timeout() {
-        let server_port = server::test::spawn_server("127.0.0.1:0", request_handler)
+        let server_port = server::test::spawn_server("127.0.0.1:0", legacy_handler(request_handler))
             .recv()
             .unwrap();
 
